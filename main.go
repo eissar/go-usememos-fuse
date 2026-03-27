@@ -11,6 +11,8 @@ import (
 	"flag"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
 	"syscall"
 	"time"
 
@@ -96,5 +98,19 @@ func main() {
 	}
 
 	log.Printf("Mounted filesystem at %s", flag.Arg(0))
+
+	// Set up signal handling for graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		sig := <-sigChan
+		log.Printf("Received signal %v, unmounting gracefully...", sig)
+		if err := server.Unmount(); err != nil {
+			log.Printf("Unmount error: %v", err)
+		}
+	}()
+
 	server.Wait()
+	log.Printf("Filesystem unmounted cleanly")
 }
