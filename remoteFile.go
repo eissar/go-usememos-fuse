@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"io"
 	"net/http"
 	"syscall"
 
@@ -11,31 +10,42 @@ import (
 )
 
 // RemoteFile implements a read‑only file whose contents are fetched from a
-// remote HTTP URL.  It embeds fs.Inode so it can be added to the tree.
+// remote HTTP URL. It embeds fs.Inode and uses caching for performance.
 type RemoteFile struct {
 	fs.Inode
-	url    string       // remote location
-	client *http.Client // reusable HTTP client
+	url         string
+	client      *http.Client
+	cache       *CacheManager
+	inode       uint64
+	contentSize uint64 // known size, 0 if unknown
 }
 
 // Ensure RemoteFile satisfies the needed interfaces.
 var (
-	_ = (fs.NodeGetattrer)((*RemoteFile)(nil))
-	_ = (fs.NodeOpener)((*RemoteFile)(nil))
-	_ = (fs.FileReader)((*RemoteFile)(nil))
+	_ fs.NodeGetattrer = (*RemoteFile)(nil)
+	_ fs.NodeOpener      = (*RemoteFile)(nil)
+	_ fs.FileReader      = (*RemoteFile)(nil)
 )
 
-// Getattr reports a static size; you could also issue a HEAD request to get
-// the real length.
+// NewRemoteFile creates a new RemoteFile with proper initialization
+func NewRemoteFile(url string, client *http.Client, cache *CacheManager, inode uint64) *RemoteFile {
+	return &RemoteFile{
+		url:     url,
+		client:  client,
+		cache:   cache,
+		inode:   inode,
+	}
+}
+
+// Getattr reports file attributes.
 func (r *RemoteFile) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
 	out.Attr.Mode = 0o444 // read‑only regular file
-	out.Attr.Size = 0     // unknown; let the kernel grow as we read
-	out.Attr.Ino = r.Inode.StableAttr().Ino
+	out.Attr.Size = r.contentSize
+	out.Attr.Ino = r.inode
 	return 0
 }
 
-// Open returns a file handle that carries no state (nil is fine for a simple
-// read‑only file).
+// Open returns a file handle.
 func (r *RemoteFile) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
 	// Disallow write flags.
 	if flags&uint32(syscall.O_WRONLY|syscall.O_RDWR) != 0 {
@@ -44,28 +54,34 @@ func (r *RemoteFile) Open(ctx context.Context, flags uint32) (fs.FileHandle, uin
 	return nil, fuse.FOPEN_KEEP_CACHE, 0
 }
 
-// Read fetches the requested range via HTTP Range requests.
+// Read fetches the requested range via HTTP Range requests with caching.
 func (r *RemoteFile) Read(ctx context.Context, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
-	req, err := http.NewRequestWithContext(ctx, "GET", r.url, nil)
+	size := len(dest)
+	if size == 0 {
+		return fuse.ReadResultData(nil), 0
+	}
+
+	// Fetch with caching
+	data, err := r.cache.FetchWithCache(ctx, r.client, r.url, off, size)
 	if err != nil {
 		return nil, syscall.EIO
 	}
 
-	resp, err := r.client.Do(req)
-	if err != nil {
-		return nil, syscall.EIO
+	// Copy data to destination buffer
+	if len(data) > size {
+		data = data[:size]
 	}
-	defer resp.Body.Close()
+	copy(dest, data)
 
-	// Check for successful response
-	if resp.StatusCode != http.StatusOK {
-		return nil, syscall.EIO
-	}
+	return fuse.ReadResultData(data), 0
+}
 
-	n, err := io.ReadFull(resp.Body, dest)
-	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
-		return nil, syscall.EIO
-	}
-	// Return only the bytes we actually read.
-	return fuse.ReadResultData(dest[:n]), 0
+// SetSize updates the known content size (from HEAD request or similar)
+func (r *RemoteFile) SetSize(size uint64) {
+	r.contentSize = size
+}
+
+// GetCacheStats returns statistics about the cache for this URL
+func (r *RemoteFile) GetCacheStats() (entries int, size int64) {
+	return r.cache.Stats()
 }
