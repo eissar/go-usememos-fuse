@@ -35,7 +35,8 @@ func NewCacheManager(maxAge time.Duration, maxSize int64) *CacheManager {
 }
 
 // Get retrieves cached data for a URL at the given offset and size.
-// Returns the data and true if found, nil and false otherwise.
+// Returns the data and true if found (even if partial), nil and false otherwise.
+// The returned data may be shorter than requested if only partial data is cached.
 func (c *CacheManager) Get(url string, offset int64, size int) ([]byte, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -46,10 +47,15 @@ func (c *CacheManager) Get(url string, offset int64, size int) ([]byte, bool) {
 	}
 
 	for _, entry := range entries {
-		if entry.Offset <= offset && entry.Offset+int64(len(entry.Data)) >= offset+int64(size) {
+		// Check if entry overlaps with requested range
+		// entry must start at or before offset, and extend past offset
+		entryEnd := entry.Offset + int64(len(entry.Data))
+
+		if entry.Offset <= offset && entryEnd > offset {
 			// Check if entry is still fresh
 			if time.Since(entry.FetchedAt) < c.maxAge {
 				start := offset - entry.Offset
+				// Return data up to what's available (may be less than requested)
 				end := start + int64(size)
 				if end > int64(len(entry.Data)) {
 					end = int64(len(entry.Data))
