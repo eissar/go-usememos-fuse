@@ -64,7 +64,7 @@ func NewMemoClient(config ClientConfig) (*MemoClient, error) {
 		return nil, fmt.Errorf("invalid base URL: %w", err)
 	}
 
-	baseURL := strings.TrimRight(parsedURL.String(), "/") + "/api/v1"
+	baseURL := strings.TrimRight(parsedURL.String(), "/")
 
 	timeout := config.HTTPTimeout
 	if timeout == 0 {

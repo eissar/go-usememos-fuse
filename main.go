@@ -2,17 +2,18 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// This program exposes files from a remote HTTP server with
-// inode management (no caching).
+// This program exposes memos from a remote Memos server via gRPC
+// as a FUSE filesystem.
 package main
 
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
-	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -25,48 +26,67 @@ import (
 type FileSystemRoot struct {
 	fs.Inode
 	inodeManager *InodeManager
-	client       *http.Client
+	client       *MemoClient
+	memoInfos    []MemoInfo
 }
 
 // Ensure FileSystemRoot implements necessary interfaces
 var _ fs.NodeGetattrer = (*FileSystemRoot)(nil)
 
 // NewFileSystemRoot creates a new filesystem root with initialized managers
-func NewFileSystemRoot() *FileSystemRoot {
+func NewFileSystemRoot(client *MemoClient) (*FileSystemRoot, error) {
 	return &FileSystemRoot{
 		inodeManager: NewInodeManager(2), // Start from 2 (1 is reserved for root)
-		client: &http.Client{
-			Timeout: 30 * time.Second,
-		},
-	}
+		client:       client,
+	}, nil
 }
 
-// OnAdd populates the filesystem with initial files
+// OnAdd populates the filesystem with memos from the MemoClient
 func (r *FileSystemRoot) OnAdd(ctx context.Context) {
-	// Add a regular memfs file
-	fileIno := r.inodeManager.Allocate()
-	ch := r.NewPersistentInode(
-		ctx,
-		&fs.MemRegularFile{
-			Data: []byte("Hello from FUSE!\n"),
-			Attr: fuse.Attr{
-				Mode: 0o644,
+	// List memos from the server
+	memos, err := r.client.ListMemos(ctx, nil)
+	if err != nil {
+		log.Printf("Warning: Failed to list memos: %v", err)
+		// Create a placeholder file with error message
+		fileIno := r.inodeManager.Allocate()
+		ch := r.NewPersistentInode(
+			ctx,
+			&fs.MemRegularFile{
+				Data: []byte(fmt.Sprintf("Error connecting to memos server: %v\n", err)),
+				Attr: fuse.Attr{
+					Mode: 0o644,
+				},
 			},
-		},
-		fs.StableAttr{Ino: fileIno})
-	r.AddChild("hello.txt", ch, false)
-	log.Printf("Created hello.txt with inode %d", fileIno)
+			fs.StableAttr{Ino: fileIno})
+		r.AddChild("error.txt", ch, false)
+		log.Printf("Created error.txt with inode %d", fileIno)
+		return
+	}
 
-	// Add remote file (no caching, fetches from remote on every read)
-	remoteIno := r.inodeManager.Allocate()
-	remoteURL := "https://gist.githubusercontent.com/eissar/493f49146f50c723056700780ffc70e8/raw/6f74ca90e256a0647141b8454c51436cdd7532a7/t.sh"
-	remoteFile := NewRemoteFile(remoteURL, r.client, remoteIno)
-	remoteInode := r.NewPersistentInode(ctx, remoteFile, fs.StableAttr{Ino: remoteIno})
-	r.AddChild("remote.bin", remoteInode, false)
-	log.Printf("Created remote.bin with inode %d (no caching)", remoteIno)
+	r.memoInfos = memos
 
-	log.Printf("Filesystem initialized: %d inodes",
-		r.inodeManager.Count())
+	// Create files for each memo
+	for _, memo := range memos {
+		fileIno := r.inodeManager.Allocate()
+		
+		// Create a file with memo content
+		ch := r.NewPersistentInode(
+			ctx,
+			&fs.MemRegularFile{
+				Data: []byte(memo.Content),
+				Attr: fuse.Attr{
+					Mode: 0o644,
+				},
+			},
+			fs.StableAttr{Ino: fileIno})
+		
+		// Use memo ID or name as filename (replace slashes to avoid subdirectory creation)
+		filename := fmt.Sprintf("memo-%s.txt", strings.ReplaceAll(memo.Name, "/", "-"))
+		r.AddChild(filename, ch, false)
+		log.Printf("Created %s with inode %d", filename, fileIno)
+	}
+
+	log.Printf("Filesystem initialized: %d memos mounted as files", len(memos))
 }
 
 // Getattr returns attributes for the root directory
@@ -76,28 +96,54 @@ func (r *FileSystemRoot) Getattr(ctx context.Context, fh fs.FileHandle, out *fus
 }
 
 // Stats returns current filesystem statistics
-func (r *FileSystemRoot) Stats() (inodeCount int) {
-	return r.inodeManager.Count()
+func (r *FileSystemRoot) Stats() (inodeCount int, memoCount int) {
+	return r.inodeManager.Count(), len(r.memoInfos)
 }
 
 func main() {
 	debug := flag.Bool("debug", false, "print debug data")
+	serverURL := flag.String("server", "", "Memos server URL (e.g., http://localhost:5230)")
+	accessToken := flag.String("token", "", "Access token for authentication (optional)")
 	flag.Parse()
 
 	if len(flag.Args()) < 1 {
-		log.Fatal("Usage:\n  hello MOUNTPOINT")
+		log.Fatal("Usage:\n  memos-fuse [flags] MOUNTPOINT")
+	}
+
+	if *serverURL == "" {
+		log.Fatal("Server URL is required. Use -server flag to specify memos server URL.")
+	}
+
+	// Create MemoClient
+	config := ClientConfig{
+		BaseURL:     *serverURL,
+		AccessToken: *accessToken,
+		HTTPTimeout: 30 * time.Second,
+	}
+	
+	client, err := NewMemoClient(config)
+	if err != nil {
+		log.Fatalf("Failed to create MemoClient: %v", err)
+	}
+	defer client.Close()
+
+	log.Printf("Connected to memos server at %s", *serverURL)
+
+	// Create filesystem root
+	root, err := NewFileSystemRoot(client)
+	if err != nil {
+		log.Fatalf("Failed to create filesystem root: %v", err)
 	}
 
 	opts := &fs.Options{}
 	opts.Debug = *debug
 
-	root := NewFileSystemRoot()
 	server, err := fs.Mount(flag.Arg(0), root, opts)
 	if err != nil {
 		log.Fatalf("Mount fail: %v\n", err)
 	}
 
-	log.Printf("Mounted filesystem at %s", flag.Arg(0))
+	log.Printf("Mounted memos filesystem at %s", flag.Arg(0))
 
 	// Set up signal handling for graceful shutdown
 	sigChan := make(chan os.Signal, 1)
